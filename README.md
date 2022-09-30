@@ -1,4 +1,4 @@
-# ZWC: a WC clone written in zig
+# zwc: a clone of the `wc` utility written in ZIG
 
 That's it. Just a line/word/character counter written in zig for learning purposes.
 
