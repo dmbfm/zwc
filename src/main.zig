@@ -29,12 +29,118 @@ const usage =
     \\
 ;
 
-fn iswspace(ch: u8) bool {
-    switch (ch) {
-        ' ', 0x0c, 0x0a, 0x0d, 0x09, 0x0b => return true,
+fn iswspace(codepoint: u21) bool {
+    switch (codepoint) {
+        ' ',
+        '\t',
+        '\n',
+        '\r',
+        11,
+        12,
+        0x0085,
+        0x2000,
+        0x2001,
+        0x2002,
+        0x2003,
+        0x2004,
+        0x2005,
+        0x2006,
+        0x2008,
+        0x2009,
+        0x200a,
+        0x2028,
+        0x2029,
+        0x205f,
+        0x3000,
+        0,
+        => return true,
         else => return false,
     }
 }
+
+const Utf8ChunkedIterator = struct {
+    chunk: []const u8,
+    i: usize = 0,
+    brokenCodepointBuffer: [4]u8 = [_]u8{ 0, 0, 0, 0 },
+    brokenCodepointSlice: ?[]u8 = null,
+    mendingBuffer: [4]u8 = [_]u8{ 0, 0, 0, 0 },
+
+    const Self = @This();
+
+    pub fn init(chunk: []const u8) Utf8ChunkedIterator {
+        return .{
+            .chunk = chunk,
+            .i = 0,
+        };
+    }
+
+    pub fn setChunk(self: *Self, chunk: []const u8) void {
+        if (self.i < self.chunk.len) unreachable;
+
+        self.chunk = chunk;
+        self.i = 0;
+    }
+
+    pub fn nextCodepointSlice(self: *Self) ?[]const u8 {
+        if (self.brokenCodepointSlice) |slice| {
+            std.debug.assert(self.i == 0);
+
+            if (self.i >= self.chunk.len) {
+                return null;
+            }
+
+            var cplen = std.unicode.utf8ByteSequenceLength(slice[0]) catch unreachable;
+
+            var i: usize = 0;
+            while (i < slice.len) {
+                self.mendingBuffer[i] = slice[i];
+                i += 1;
+            }
+
+            while (i < cplen) {
+                self.mendingBuffer[i] = self.chunk[i - slice.len];
+                i += 1;
+            }
+
+            self.i += cplen - slice.len;
+            self.brokenCodepointSlice = null;
+
+            return self.mendingBuffer[0..cplen];
+        }
+
+        if (self.i >= self.chunk.len) {
+            return null;
+        }
+
+        var cplen = std.unicode.utf8ByteSequenceLength(self.chunk[self.i]) catch unreachable;
+        var cp_will_overflow: bool = (self.i + cplen - 1) >= self.chunk.len;
+
+        if (cp_will_overflow) {
+            var i: usize = self.i;
+            var count: usize = 0;
+            while (i < self.chunk.len) : (i += 1) {
+                self.brokenCodepointBuffer[i - self.i] = self.chunk[i];
+                count += 1;
+            }
+
+            self.brokenCodepointSlice = self.brokenCodepointBuffer[0..count];
+            self.i = self.chunk.len;
+            return null;
+        }
+
+        self.i += cplen;
+        return self.chunk[self.i - cplen .. self.i];
+    }
+
+    pub fn nextCodepoint(self: *Self) ?u21 {
+        if (self.nextCodepointSlice()) |slice| {
+            var cp = std.unicode.utf8Decode(slice) catch unreachable;
+            return cp;
+        }
+
+        return null;
+    }
+};
 
 fn wcFile(comptime buf_size: comptime_int, filename: []const u8, config: WcConfig) !WcResult {
     var file = try std.fs.cwd().openFile(filename, .{});
@@ -61,9 +167,12 @@ fn wcFileHandle(comptime buf_size: comptime_int, fileHandle: std.fs.File.Handle,
     var num_chars: usize = 0;
     var num_lines: usize = 0;
     var num_words: usize = 0;
-    var is_in_middle_of_word = false;
-    var is_in_middle_of_char = false;
-    var char_remaining_size: usize = 0;
+
+    // 0 -> ouside word
+    // 1 -> inside word
+    var state: i32 = 0;
+
+    var it = Utf8ChunkedIterator.init(&[_]u8{});
 
     while (true) {
         var bytes_read = try std.os.read(fileHandle, &buf);
@@ -71,86 +180,28 @@ fn wcFileHandle(comptime buf_size: comptime_int, fileHandle: std.fs.File.Handle,
 
         num_bytes += bytes_read;
 
-        var ch: u8 = undefined;
-        var cursor: usize = char_remaining_size;
-        var eat: bool = true;
+        it.setChunk(buf[0..bytes_read]);
 
-        char_remaining_size = 0;
-
-        outer: while (true) {
-            if (eat) {
-                if (cursor >= bytes_read) break;
-                ch = buf[cursor];
-                cursor += characterLenUtf8(ch);
-            } else {
-                eat = true;
-            }
-
-            if (iswspace(ch)) {
-                if (is_in_middle_of_word) {
-                    is_in_middle_of_word = false;
-                }
-
-                while (iswspace(ch)) {
-                    num_chars += 1;
-                    if (cursor >= bytes_read) break :outer;
-                    ch = buf[cursor];
-                    cursor += characterLenUtf8(ch);
-                }
-
-                eat = false;
-                continue;
-            }
-
-            if (ch == '\n') {
-                if (is_in_middle_of_word) {
-                    is_in_middle_of_word = false;
-                }
-                num_lines += 1;
-                num_chars += 1;
-                continue;
-            }
-
-            if (is_in_middle_of_word) {
-                num_words -= 1;
-                is_in_middle_of_word = false;
-            }
-
-            if (is_in_middle_of_char) {
-                cursor += char_remaining_size - 1;
-                char_remaining_size = 0;
-                is_in_middle_of_char = false;
-
-                if (cursor >= bytes_read) {
-                    break :outer;
-                }
-            }
-
-            while (true) {
-                num_chars += 1;
-                // var char_len = characterLenUtf8(ch);
-                // cursor += (char_len - 1);
-
-                if (cursor >= bytes_read) {
-                    char_remaining_size = cursor - bytes_read;
-                    is_in_middle_of_word = true;
-                    num_words += 1;
-                    break :outer;
-                }
-
-                ch = buf[cursor];
-                cursor += characterLenUtf8(ch);
-
-                if (iswspace(ch)) {
-                    num_words += 1;
-                    num_chars += 1;
-                    break;
-                } else if (ch == '\n') {
-                    num_words += 1;
-                    num_lines += 1;
-                    num_chars += 1;
-                    break;
-                }
+        while (it.nextCodepoint()) |c| {
+            num_chars += 1;
+            switch (state) {
+                0 => {
+                    if (c == '\n') {
+                        num_lines += 1;
+                    } else if (!iswspace(c)) {
+                        state = 1;
+                    }
+                },
+                1 => {
+                    if (iswspace(c)) {
+                        if (c == '\n') {
+                            num_lines += 1;
+                        }
+                        num_words += 1;
+                        state = 0;
+                    }
+                },
+                else => unreachable,
             }
         }
     }
@@ -216,7 +267,6 @@ pub fn main() !void {
         }
 
         if (arg[0] == '-') {
-            // Fail if no flag
             if (arg.len == 1) {
                 try stdout.writeAll(usage);
                 std.os.exit(0);
@@ -263,7 +313,7 @@ pub fn main() !void {
     var i: usize = 0;
 
     while (i < num_files) : (i += 1) {
-        var result: ?WcResult = wcFile(1024, filenames[i], config) catch |err|
+        var result: ?WcResult = wcFile(4096, arena, filenames[i], config) catch |err|
             blk: {
             switch (err) {
                 std.fs.File.OpenError.FileNotFound => {
@@ -281,74 +331,7 @@ pub fn main() !void {
     }
 
     if (num_files == 0) {
-        var result = try wcFileHandle(1024, std.io.getStdIn().handle, config);
+        var result = try wcFileHandle(4096, std.io.getStdIn().handle, config);
         try printResult(result, null);
     }
-}
-
-const wchar = u32;
-
-fn iswspace2(codepoint: u21) bool {
-    switch (codepoint) {
-        ' ',
-        '\t',
-        '\n',
-        '\r',
-        11,
-        12,
-        0x0085,
-        0x2000,
-        0x2001,
-        0x2002,
-        0x2003,
-        0x2004,
-        0x2005,
-        0x2006,
-        0x2008,
-        0x2009,
-        0x200a,
-        0x2028,
-        0x2029,
-        0x205f,
-        0x3000,
-        0,
-        => return true,
-        else => return false,
-    }
-}
-
-fn characterLenUtf8(c: u8) usize {
-    if (c & 0b1000_0000 == 0) {
-        return 1;
-    } else if (c & 0b1110_0000 == 0b1100_0000) {
-        return 2;
-    } else if (c & 0b1111_0000 == 0b1110_0000) {
-        return 3;
-    } else if (c & 0b1111_1000 == 0b1111_0000) {
-        return 4;
-    }
-
-    unreachable;
-}
-
-const testing = std.testing;
-test "characterLenUtf8" {
-    try testing.expect(characterLenUtf8('a') == 1);
-    try testing.expect(characterLenUtf8(0xC2) == 2);
-    try testing.expect(characterLenUtf8(0xE0) == 3);
-    try testing.expect(characterLenUtf8(0xF0) == 4);
-}
-
-test "wchar" {
-    var unicode_char = "🤯";
-    var unicode_char2 = "ࠀ";
-    var unicode_char3 = " ";
-
-    var codepoint = try std.unicode.utf8Decode(unicode_char);
-    var codepoint2 = try std.unicode.utf8Decode(unicode_char2);
-    var codepoint3 = try std.unicode.utf8Decode(unicode_char3);
-
-    try testing.expect(!iswspace2(codepoint));
-    try testing.expect(!iswspace2(codepoint2));
-    try testing.expect(iswspace2(codepoint3));
 }
