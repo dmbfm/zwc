@@ -214,19 +214,19 @@ fn wcFileHandle(comptime buf_size: comptime_int, fileHandle: std.fs.File.Handle,
 
 fn printResult(result: WcResult, filename: ?[]const u8) !void {
     if (result.num_lines) |num_lines| {
-        try stdout.print("    {}", .{num_lines});
+        try stdout.print(" {:>7}", .{num_lines});
     }
 
     if (result.num_words) |num_words| {
-        try stdout.print("    {}", .{num_words});
+        try stdout.print(" {:>7}", .{num_words});
     }
 
     if (result.num_bytes) |num_bytes| {
-        try stdout.print("    {}", .{num_bytes});
+        try stdout.print(" {:>7}", .{num_bytes});
     }
 
     if (result.num_chars) |num_chars| {
-        try stdout.print("    {}", .{num_chars});
+        try stdout.print(" {:>7}", .{num_chars});
     }
 
     if (filename) |_filename| {
@@ -311,7 +311,7 @@ pub fn main() !void {
     var i: usize = 0;
 
     while (i < num_files) : (i += 1) {
-        var result: ?WcResult = wcFile(4096, arena, filenames[i], config) catch |err|
+        var result: ?WcResult = wcFile(4096, filenames[i], config) catch |err|
             blk: {
             switch (err) {
                 std.fs.File.OpenError.FileNotFound => {
