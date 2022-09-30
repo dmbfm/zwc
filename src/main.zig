@@ -12,12 +12,14 @@ const stdin = std.io.getStdIn().reader();
 
 const WcConfig = struct {
     chars: bool = true,
+    bytes: bool = true,
     lines: bool = true,
     words: bool = true,
 };
 
 const WcResult = struct {
     num_chars: ?usize = null,
+    num_bytes: ?usize = null,
     num_lines: ?usize = null,
     num_words: ?usize = null,
 };
@@ -26,6 +28,13 @@ const usage =
     \\usage: zwc [-clmw] [file ...]
     \\
 ;
+
+fn iswspace(ch: u8) bool {
+    switch (ch) {
+        ' ', 0x0c, 0x0a, 0x0d, 0x09, 0x0b => return true,
+        else => return false,
+    }
+}
 
 fn wcFile(comptime buf_size: comptime_int, filename: []const u8, config: WcConfig) !WcResult {
     var file = try std.fs.cwd().openFile(filename, .{});
@@ -37,7 +46,7 @@ fn wcFile(comptime buf_size: comptime_int, filename: []const u8, config: WcConfi
 fn wcFileHandle(comptime buf_size: comptime_int, fileHandle: std.fs.File.Handle, config: WcConfig) !WcResult {
     var buf: [buf_size]u8 = undefined;
 
-    if (!config.words and !config.lines) {
+    if (config.bytes and !config.words and !config.lines and !config.chars) {
         var bytes: usize = 0;
         while (true) {
             var bytes_read = try std.os.read(fileHandle, &buf);
@@ -45,42 +54,48 @@ fn wcFileHandle(comptime buf_size: comptime_int, fileHandle: std.fs.File.Handle,
             bytes += bytes_read;
         }
 
-        return .{ .num_chars = bytes };
+        return .{ .num_bytes = bytes };
     }
 
+    var num_bytes: usize = 0;
     var num_chars: usize = 0;
     var num_lines: usize = 0;
     var num_words: usize = 0;
     var is_in_middle_of_word = false;
+    var is_in_middle_of_char = false;
+    var char_remaining_size: usize = 0;
 
     while (true) {
         var bytes_read = try std.os.read(fileHandle, &buf);
         if (bytes_read == 0) break;
 
-        num_chars += bytes_read;
+        num_bytes += bytes_read;
 
         var ch: u8 = undefined;
-        var cursor: usize = 0;
+        var cursor: usize = char_remaining_size;
         var eat: bool = true;
+
+        char_remaining_size = 0;
 
         outer: while (true) {
             if (eat) {
                 if (cursor >= bytes_read) break;
                 ch = buf[cursor];
-                cursor += 1;
+                cursor += characterLenUtf8(ch);
             } else {
                 eat = true;
             }
 
-            if (ch == ' ') {
+            if (iswspace(ch)) {
                 if (is_in_middle_of_word) {
                     is_in_middle_of_word = false;
                 }
 
-                while (ch == ' ') {
+                while (iswspace(ch)) {
+                    num_chars += 1;
                     if (cursor >= bytes_read) break :outer;
                     ch = buf[cursor];
-                    cursor += 1;
+                    cursor += characterLenUtf8(ch);
                 }
 
                 eat = false;
@@ -92,6 +107,7 @@ fn wcFileHandle(comptime buf_size: comptime_int, fileHandle: std.fs.File.Handle,
                     is_in_middle_of_word = false;
                 }
                 num_lines += 1;
+                num_chars += 1;
                 continue;
             }
 
@@ -100,22 +116,39 @@ fn wcFileHandle(comptime buf_size: comptime_int, fileHandle: std.fs.File.Handle,
                 is_in_middle_of_word = false;
             }
 
-            while (true) {
+            if (is_in_middle_of_char) {
+                cursor += char_remaining_size - 1;
+                char_remaining_size = 0;
+                is_in_middle_of_char = false;
+
                 if (cursor >= bytes_read) {
+                    break :outer;
+                }
+            }
+
+            while (true) {
+                num_chars += 1;
+                // var char_len = characterLenUtf8(ch);
+                // cursor += (char_len - 1);
+
+                if (cursor >= bytes_read) {
+                    char_remaining_size = cursor - bytes_read;
                     is_in_middle_of_word = true;
                     num_words += 1;
                     break :outer;
                 }
 
                 ch = buf[cursor];
-                cursor += 1;
+                cursor += characterLenUtf8(ch);
 
-                if (ch == ' ') {
+                if (iswspace(ch)) {
                     num_words += 1;
+                    num_chars += 1;
                     break;
                 } else if (ch == '\n') {
                     num_words += 1;
                     num_lines += 1;
+                    num_chars += 1;
                     break;
                 }
             }
@@ -124,6 +157,7 @@ fn wcFileHandle(comptime buf_size: comptime_int, fileHandle: std.fs.File.Handle,
 
     return .{
         .num_chars = if (config.chars) num_chars else null,
+        .num_bytes = if (config.bytes) num_bytes else null,
         .num_lines = if (config.lines) num_lines else null,
         .num_words = if (config.words) num_words else null,
     };
@@ -136,6 +170,10 @@ fn printResult(result: WcResult, filename: ?[]const u8) !void {
 
     if (result.num_words) |num_words| {
         try stdout.print("    {}", .{num_words});
+    }
+
+    if (result.num_bytes) |num_bytes| {
+        try stdout.print("    {}", .{num_bytes});
     }
 
     if (result.num_chars) |num_chars| {
@@ -217,7 +255,8 @@ pub fn main() !void {
         flag_w = true;
     }
 
-    config.chars = flag_c or flag_m;
+    config.bytes = flag_c and !flag_m;
+    config.chars = flag_m;
     config.lines = flag_l;
     config.words = flag_w;
 
@@ -245,4 +284,71 @@ pub fn main() !void {
         var result = try wcFileHandle(1024, std.io.getStdIn().handle, config);
         try printResult(result, null);
     }
+}
+
+const wchar = u32;
+
+fn iswspace2(codepoint: u21) bool {
+    switch (codepoint) {
+        ' ',
+        '\t',
+        '\n',
+        '\r',
+        11,
+        12,
+        0x0085,
+        0x2000,
+        0x2001,
+        0x2002,
+        0x2003,
+        0x2004,
+        0x2005,
+        0x2006,
+        0x2008,
+        0x2009,
+        0x200a,
+        0x2028,
+        0x2029,
+        0x205f,
+        0x3000,
+        0,
+        => return true,
+        else => return false,
+    }
+}
+
+fn characterLenUtf8(c: u8) usize {
+    if (c & 0b1000_0000 == 0) {
+        return 1;
+    } else if (c & 0b1110_0000 == 0b1100_0000) {
+        return 2;
+    } else if (c & 0b1111_0000 == 0b1110_0000) {
+        return 3;
+    } else if (c & 0b1111_1000 == 0b1111_0000) {
+        return 4;
+    }
+
+    unreachable;
+}
+
+const testing = std.testing;
+test "characterLenUtf8" {
+    try testing.expect(characterLenUtf8('a') == 1);
+    try testing.expect(characterLenUtf8(0xC2) == 2);
+    try testing.expect(characterLenUtf8(0xE0) == 3);
+    try testing.expect(characterLenUtf8(0xF0) == 4);
+}
+
+test "wchar" {
+    var unicode_char = "🤯";
+    var unicode_char2 = "ࠀ";
+    var unicode_char3 = " ";
+
+    var codepoint = try std.unicode.utf8Decode(unicode_char);
+    var codepoint2 = try std.unicode.utf8Decode(unicode_char2);
+    var codepoint3 = try std.unicode.utf8Decode(unicode_char3);
+
+    try testing.expect(!iswspace2(codepoint));
+    try testing.expect(!iswspace2(codepoint2));
+    try testing.expect(iswspace2(codepoint3));
 }
