@@ -1,8 +1,6 @@
 // zwc -- A `wc` clone written in zig.
 //
-// TODO:
-// - [ ] utf8 support
-//
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
